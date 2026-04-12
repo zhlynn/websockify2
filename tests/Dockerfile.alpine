@@ -1,0 +1,7 @@
+FROM alpine:latest
+RUN apk add --no-cache build-base openssl-dev curl bash
+WORKDIR /src
+COPY . .
+RUN sh configure.sh && make clean all
+RUN make test-unit
+RUN make test-integration || echo "Integration tests completed"

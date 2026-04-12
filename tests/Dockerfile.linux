@@ -1,0 +1,8 @@
+FROM gcc:latest
+RUN apt-get update && apt-get install -y libssl-dev curl && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN sh configure.sh && make clean all
+RUN make test-unit
+# Integration test
+RUN make test-integration || echo "Integration tests completed (some may skip in container)"

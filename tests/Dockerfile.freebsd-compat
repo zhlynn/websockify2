@@ -1,0 +1,9 @@
+# FreeBSD simulation via Alpine (kqueue-compatible)
+# For actual FreeBSD testing, use a VM or CI service.
+# This validates the codebase compiles with musl libc.
+FROM alpine:latest
+RUN apk add --no-cache build-base openssl-dev curl bash
+WORKDIR /src
+COPY . .
+RUN sh configure.sh && make clean all
+RUN make test-unit

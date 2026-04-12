@@ -1,0 +1,176 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+
+jobs:
+  # ----------------------------------------------------------
+  # Build release binaries for multiple platforms
+  # ----------------------------------------------------------
+  build-release:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            artifact: websockify2-linux-x86_64
+          - os: macos-latest
+            name: macos-arm64
+            artifact: websockify2-macos-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - name: Build (static-ish, stripped)
+        env:
+          CFLAGS: "-O3 -Wall -Wextra -DNDEBUG"
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          sh configure.sh
+          make all VERSION=${TAG#v}
+          strip build/bin/websockify2 || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/bin/websockify2 dist/
+          cp README.md README.zh-CN.md dist/
+          cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  # ----------------------------------------------------------
+  # Windows (MSYS2 / MinGW-w64)
+  # ----------------------------------------------------------
+  build-windows:
+    name: Build windows-x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-pkg-config
+            make
+            zip
+
+      - name: Build
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          sh configure.sh
+          make all VERSION=${TAG#v}
+          strip build/bin/websockify2.exe || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/bin/websockify2.exe dist/
+          cp README.md README.zh-CN.md dist/
+          # Copy required DLLs
+          ldd build/bin/websockify2.exe | grep mingw64 | awk '{print $3}' | xargs -I{} cp {} dist/ 2>/dev/null || true
+          cd dist && zip -r ../websockify2-windows-x86_64.zip *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: websockify2-windows-x86_64
+          path: websockify2-windows-x86_64.zip
+
+  # ----------------------------------------------------------
+  # Alpine (musl libc) static binary
+  # ----------------------------------------------------------
+  build-alpine-static:
+    name: Build linux-musl-static
+    runs-on: ubuntu-latest
+    container: alpine:latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: apk add --no-cache build-base openssl-dev openssl-libs-static
+
+      - name: Build static binary
+        env:
+          LDFLAGS: "-static"
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          sh configure.sh
+          make all VERSION=${TAG#v}
+          strip build/bin/websockify2 || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/bin/websockify2 dist/
+          cp README.md README.zh-CN.md dist/
+          cd dist && tar czf ../websockify2-linux-musl-static.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: websockify2-linux-musl-static
+          path: websockify2-linux-musl-static.tar.gz
+
+  # ----------------------------------------------------------
+  # Create GitHub Release with all artifacts
+  # ----------------------------------------------------------
+  release:
+    name: Publish Release
+    needs: [build-release, build-windows, build-alpine-static]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip

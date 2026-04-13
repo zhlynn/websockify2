@@ -2,6 +2,7 @@
 #include "web.h"
 #include "log.h"
 #include <sys/stat.h>
+#include <fcntl.h>
 
 typedef struct {
     const char *ext;

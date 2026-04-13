@@ -610,7 +610,11 @@ static int forward_target_to_client(ws_conn_t *conn) {
         uint32_t need = (uint32_t)hdr_len + chunk;
 
         if (ws_buf_writable(&conn->client_send) < need) {
-            ws_event_mod(conn->loop, conn->target_fd, 0, NULL, NULL);
+            /* Pause target reads. Preserve target WRITE interest when
+             * the client→target path is itself backpressured, otherwise
+             * that direction would stall until the next target event. */
+            int tev = ws_buf_empty(&conn->target_send) ? 0 : WS_EV_WRITE;
+            ws_event_mod(conn->loop, conn->target_fd, tev, NULL, NULL);
             ws_event_mod(conn->loop, conn->client_fd,
                         WS_EV_READ | WS_EV_WRITE, NULL, NULL);
             break;
@@ -753,8 +757,12 @@ static void on_client_event(ws_event_loop_t *loop, ws_socket_t fd, int events, v
         if (ws_buf_empty(&conn->client_send)) {
             ws_event_mod(conn->loop, conn->client_fd, WS_EV_READ, NULL, NULL);
             if (conn->state == CONN_STATE_PROXYING && conn->target_fd >= 0) {
-                ws_event_mod(conn->loop, conn->target_fd,
-                            WS_EV_READ, NULL, NULL);
+                /* Re-enable target reads; preserve WRITE interest if
+                 * client→target is still draining, else we'd clobber
+                 * the registration made by flush_target_send. */
+                int tev = WS_EV_READ;
+                if (!ws_buf_empty(&conn->target_send)) tev |= WS_EV_WRITE;
+                ws_event_mod(conn->loop, conn->target_fd, tev, NULL, NULL);
                 if (!ws_buf_empty(&conn->target_recv)) {
                     if (forward_target_to_client(conn) < 0) goto close_conn;
                 }

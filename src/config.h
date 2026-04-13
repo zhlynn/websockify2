@@ -7,7 +7,7 @@
 
 #define WS_VERSION "1.0.0"
 #define WS_DEFAULT_BACKLOG    512
-#define WS_DEFAULT_BUFSIZE    65536
+#define WS_DEFAULT_BUFSIZE    (1024u * 1024u)
 #define WS_DEFAULT_MAX_CONN   10000
 #define WS_MAX_HEADER_SIZE    8192
 #define WS_MAX_PATH           4096

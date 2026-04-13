@@ -56,26 +56,26 @@ Supports Linux (`epoll`), macOS / FreeBSD (`kqueue`), Windows (`WSAPoll` via Min
 ## Usage
 
 ```
-websockify [options] [listen_host:]listen_port [target_host:target_port]
+websockify2 [options] [listen_host:]listen_port [target_host:target_port]
 ```
 
 ### Common scenarios
 
 ```bash
 # Basic proxy (noVNC)
-websockify 8080 localhost:5900
+websockify2 8080 localhost:5900
 
 # All-in-one noVNC (static files + proxy)
-websockify --web /path/to/noVNC 8080 localhost:5900
+websockify2 --web /path/to/noVNC 8080 localhost:5900
 
 # SSL/TLS
-websockify -c server.pem -s 443 localhost:5900
+websockify2 -c server.pem -s 443 localhost:5900
 
 # Daemon
-websockify -D -p /run/ws.pid -l /var/log/ws.log 8080 localhost:5900
+websockify2 -D -p /run/ws.pid -l /var/log/ws.log 8080 localhost:5900
 
 # Multi-core (multiple instances share port via SO_REUSEPORT)
-for i in 1 2 3 4; do websockify -D --pid-file /run/ws-$i.pid 8080 localhost:5900; done
+for i in 1 2 3 4; do websockify2 -D --pid-file /run/ws-$i.pid 8080 localhost:5900; done
 ```
 
 ### Options
@@ -125,7 +125,7 @@ sh tests/docker_test.sh # Linux glibc + Alpine musl cross-platform
 
 # Benchmark
 ./build/bin/echo_server 5900 &
-./build/bin/websockify 8080 localhost:5900 &
+./build/bin/websockify2 8080 localhost:5900 &
 ./build/bin/bench_connections 127.0.0.1 8080 1000 1024 10
 ```
 
@@ -152,7 +152,7 @@ Modules: `server` (entry) → `proxy` (state machine) → `ws` / `http` / `ssl_c
 Yes — websockify2 implements the same command-line interface and WebSocket-to-TCP bridging behavior, with substantially lower memory and higher concurrency. Drop it in for noVNC deployments, browser-based SSH, or any scenario where a WebSocket gateway is needed.
 
 **Does it work with noVNC?**
-Yes. `websockify --web /path/to/noVNC 6080 localhost:5900` gives you a complete browser-based VNC setup.
+Yes. `websockify2 --web /path/to/noVNC 6080 localhost:5900` gives you a complete browser-based VNC setup.
 
 **How does it compare to nginx / haproxy WebSocket proxying?**
 nginx/haproxy can forward WebSocket connections, but they cannot translate WebSocket frames into raw TCP. websockify2 is specifically for bridging browser WebSocket clients to backends that don't speak WebSocket.

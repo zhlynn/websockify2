@@ -56,26 +56,26 @@ sudo make install   # 可选，安装到 /usr/local/bin
 ## 使用
 
 ```
-websockify [options] [listen_host:]listen_port [target_host:target_port]
+websockify2 [options] [listen_host:]listen_port [target_host:target_port]
 ```
 
 ### 常见场景
 
 ```bash
 # 基本代理（noVNC）
-websockify 8080 localhost:5900
+websockify2 8080 localhost:5900
 
 # 一体化 noVNC（静态文件 + 代理）
-websockify --web /path/to/noVNC 8080 localhost:5900
+websockify2 --web /path/to/noVNC 8080 localhost:5900
 
 # SSL/TLS
-websockify -c server.pem -s 443 localhost:5900
+websockify2 -c server.pem -s 443 localhost:5900
 
 # 守护进程
-websockify -D -p /run/ws.pid -l /var/log/ws.log 8080 localhost:5900
+websockify2 -D -p /run/ws.pid -l /var/log/ws.log 8080 localhost:5900
 
 # 多核扩展（通过 SO_REUSEPORT 启动多实例共享端口）
-for i in 1 2 3 4; do websockify -D --pid-file /run/ws-$i.pid 8080 localhost:5900; done
+for i in 1 2 3 4; do websockify2 -D --pid-file /run/ws-$i.pid 8080 localhost:5900; done
 ```
 
 ### 选项
@@ -125,7 +125,7 @@ sh tests/docker_test.sh # Linux glibc + Alpine musl 跨平台
 
 # 压测
 ./build/bin/echo_server 5900 &
-./build/bin/websockify 8080 localhost:5900 &
+./build/bin/websockify2 8080 localhost:5900 &
 ./build/bin/bench_connections 127.0.0.1 8080 1000 1024 10
 ```
 
@@ -152,7 +152,7 @@ sh tests/docker_test.sh # Linux glibc + Alpine musl 跨平台
 可以。websockify2 实现了相同的命令行接口和 WebSocket-TCP 桥接行为，内存占用显著降低、并发能力更强。适用于 noVNC 部署、浏览器 SSH，或任何需要 WebSocket 网关的场景。
 
 **能和 noVNC 一起用吗？**
-可以。`websockify --web /path/to/noVNC 6080 localhost:5900` 即可搭建完整的浏览器 VNC 方案。
+可以。`websockify2 --web /path/to/noVNC 6080 localhost:5900` 即可搭建完整的浏览器 VNC 方案。
 
 **和 nginx / haproxy 的 WebSocket 代理有何区别？**
 nginx/haproxy 能转发 WebSocket 连接，但无法将 WebSocket 帧翻译为原始 TCP。websockify2 专门用于将浏览器 WebSocket 客户端桥接到不支持 WebSocket 的后端。

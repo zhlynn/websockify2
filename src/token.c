@@ -1,8 +1,13 @@
 /* SPDX-License-Identifier: MIT */
 #include "token.h"
 #include "log.h"
+#include <sys/stat.h>
 #include <dirent.h>
 #include <ctype.h>
+
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
 
 int ws_token_init(ws_token_ctx_t *ctx, const char *path) {
     memset(ctx, 0, sizeof(*ctx));

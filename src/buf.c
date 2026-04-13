@@ -166,12 +166,27 @@ void ws_dbuf_free(ws_dbuf_t *b) {
     b->len = b->cap = 0;
 }
 
+/* Cap dynamic buffers at 16 MiB — way beyond any legitimate HTTP header. */
+#define WS_DBUF_MAX_CAP (16u * 1024u * 1024u)
+
 int ws_dbuf_reserve(ws_dbuf_t *b, uint32_t additional) {
+    /* Guard against overflow */
+    if (additional > WS_DBUF_MAX_CAP || b->len > WS_DBUF_MAX_CAP - additional)
+        return -1;
     uint32_t need = b->len + additional;
     if (need <= b->cap) return 0;
 
+    /* Grow by 1.5x (less wasteful than 2x for many small appends) */
     uint32_t newcap = b->cap ? b->cap : 256;
-    while (newcap < need) newcap *= 2;
+    while (newcap < need) {
+        uint32_t grown = newcap + (newcap >> 1);
+        if (grown < newcap || grown > WS_DBUF_MAX_CAP) {
+            newcap = WS_DBUF_MAX_CAP;
+            break;
+        }
+        newcap = grown;
+    }
+    if (newcap < need) return -1;
 
     uint8_t *p = (uint8_t *)realloc(b->data, newcap);
     if (!p) return -1;

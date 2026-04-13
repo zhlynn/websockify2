@@ -99,6 +99,8 @@ int ws_http_parse_request(ws_http_request_t *req, const char *data, int len) {
     while (p < req->raw + total - 2) {
         line_end = strstr(p, "\r\n");
         if (!line_end) break;
+        /* RFC 7230 recommends 8000 bytes max per header line */
+        if ((size_t)(line_end - p) > 8000) return -1;
         *line_end = '\0';
 
         if (p == line_end) break;  /* empty line */

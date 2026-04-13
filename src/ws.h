@@ -24,6 +24,15 @@
 /* Max frame header is 14 bytes (2 base + 8 extended length + 4 mask) */
 #define WS_MAX_FRAME_HEADER 14
 
+/* Hard cap for a single WebSocket frame payload (64 MiB).
+ * Prevents malicious peers from claiming huge payload_len values. */
+#ifndef WS_MAX_FRAME_PAYLOAD
+#define WS_MAX_FRAME_PAYLOAD (64ULL * 1024ULL * 1024ULL)
+#endif
+
+/* Control-frame payloads are limited to 125 bytes by RFC 6455 */
+#define WS_MAX_CONTROL_PAYLOAD 125
+
 typedef struct {
     uint8_t  fin;
     uint8_t  opcode;

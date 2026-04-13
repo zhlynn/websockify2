@@ -82,6 +82,10 @@ int ws_proxy_init(ws_proxy_ctx_t *ctx, ws_config_t *config,
     /* Token context */
     if (config->token_plugin[0]) {
         ctx->token_ctx = (ws_token_ctx_t *)malloc(sizeof(ws_token_ctx_t));
+        if (!ctx->token_ctx) {
+            ws_log_error("out of memory allocating token context");
+            return -1;
+        }
         if (ws_token_init(ctx->token_ctx, config->token_plugin) < 0) {
             free(ctx->token_ctx);
             ctx->token_ctx = NULL;
@@ -144,11 +148,18 @@ void ws_proxy_on_accept(ws_event_loop_t *loop, ws_socket_t fd, int events, void 
         snprintf(conn->client_addr, sizeof(conn->client_addr), "%s", addr);
         conn->client_port = port;
 
-        /* Initialize buffers */
-        ws_buf_init(&conn->client_recv, (uint32_t)ctx->config->buffer_size);
-        ws_buf_init(&conn->client_send, (uint32_t)ctx->config->buffer_size);
-        ws_buf_init(&conn->target_recv, (uint32_t)ctx->config->buffer_size);
-        ws_buf_init(&conn->target_send, (uint32_t)ctx->config->buffer_size);
+        /* Initialize buffers — if any allocation fails, drop the connection
+         * immediately (accessing a NULL .data later would crash the process). */
+        int bufsz = ctx->config->buffer_size;
+        if (ws_buf_init(&conn->client_recv, (uint32_t)bufsz) < 0 ||
+            ws_buf_init(&conn->client_send, (uint32_t)bufsz) < 0 ||
+            ws_buf_init(&conn->target_recv, (uint32_t)bufsz) < 0 ||
+            ws_buf_init(&conn->target_send, (uint32_t)bufsz) < 0) {
+            ws_log_error("out of memory initializing connection buffers");
+            conn_close(conn);
+            conn_release(ctx, conn);
+            continue;
+        }
         ws_dbuf_init(&conn->http_buf);
 
         ws_set_tcp_nodelay(client_fd, 1);
@@ -210,6 +221,8 @@ static void conn_close(ws_conn_t *conn) {
     }
 
     if (conn->client_ssl) {
+        /* Best-effort graceful TLS close; never block the close path */
+        ws_ssl_shutdown(conn->client_ssl);
         ws_ssl_free(conn->client_ssl);
         conn->client_ssl = NULL;
     }
@@ -527,11 +540,17 @@ static int process_ws_frame(ws_conn_t *conn) {
             uint32_t rd = ws_buf_read(&conn->client_recv, tmp, WS_MIN(chunk, (uint32_t)sizeof(tmp)));
             if (rd == 0) break;
 
-            /* Unmask if needed */
+            /* Unmask if needed. Rotate the mask by the payload offset
+             * already consumed so the 64-bit fast path in
+             * ws_frame_apply_mask stays correct across chunks. */
             if (conn->ws_hdr.masked) {
-                for (uint32_t i = 0; i < rd; i++) {
-                    tmp[i] ^= conn->ws_hdr.mask[(conn->ws_payload_read + i) & 3];
-                }
+                uint8_t rot[4];
+                uint32_t off = (uint32_t)(conn->ws_payload_read & 3);
+                rot[0] = conn->ws_hdr.mask[(0 + off) & 3];
+                rot[1] = conn->ws_hdr.mask[(1 + off) & 3];
+                rot[2] = conn->ws_hdr.mask[(2 + off) & 3];
+                rot[3] = conn->ws_hdr.mask[(3 + off) & 3];
+                ws_frame_apply_mask(tmp, rd, rot);
             }
 
             /* Handle based on opcode */
@@ -665,8 +684,12 @@ static void on_client_event(ws_event_loop_t *loop, ws_socket_t fd, int events, v
             }
 
             if (conn->state == CONN_STATE_HTTP_REQUEST) {
-                ws_dbuf_append(&conn->http_buf, tmp, (uint32_t)n);
-                if (conn->http_buf.len > WS_MAX_HEADER_SIZE) goto close_conn;
+                /* Cap header size BEFORE appending so oversize requests
+                 * can never trigger large allocations. */
+                if (conn->http_buf.len + (uint32_t)n > WS_MAX_HEADER_SIZE)
+                    goto close_conn;
+                if (ws_dbuf_append(&conn->http_buf, tmp, (uint32_t)n) < 0)
+                    goto close_conn;
                 if (handle_http_request(conn) < 0) goto close_conn;
             } else if (conn->state == CONN_STATE_PROXYING ||
                        conn->state == CONN_STATE_CONNECTING) {
@@ -688,15 +711,21 @@ static void on_client_event(ws_event_loop_t *loop, ws_socket_t fd, int events, v
         }
 
         if (conn->state == CONN_STATE_WEB_SERVING) {
-            /* Send file content */
+            /* Send file content. pread() keeps our own offset authoritative
+             * so a partial write (sent < nr) doesn't lose the unsent tail. */
             if (conn->file_sent < conn->file_size) {
                 uint8_t fbuf[16384];
                 size_t toread = WS_MIN(sizeof(fbuf), conn->file_size - conn->file_sent);
-                ssize_t nr = read(conn->file_fd, fbuf, toread);
-                if (nr > 0) {
-                    int sent = client_send_raw(conn, fbuf, (int)nr);
-                    if (sent > 0) conn->file_sent += (size_t)sent;
+                ssize_t nr = pread(conn->file_fd, fbuf, toread, (off_t)conn->file_sent);
+                if (nr <= 0) {
+                    if (nr < 0 && (ws_errno() == WS_EAGAIN || ws_errno() == WS_EINTR))
+                        return;
+                    goto close_conn;
                 }
+                int sent = client_send_raw(conn, fbuf, (int)nr);
+                if (sent < 0) goto close_conn;
+                if (sent == 0) return;  /* would block, retry on next WRITE */
+                conn->file_sent += (size_t)sent;
                 if (conn->file_sent >= conn->file_size) goto close_conn;
             }
             return;

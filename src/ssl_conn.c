@@ -73,6 +73,7 @@ ws_ssl_ctx_t *ws_ssl_ctx_create(const char *cert, const char *key,
     return ctx;
 
 err:
+    ERR_clear_error();
     SSL_CTX_free(ctx->ctx);
     free(ctx);
     return NULL;

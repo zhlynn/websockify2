@@ -4,22 +4,66 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <ctype.h>
+#ifndef WS_PLATFORM_WINDOWS
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #ifndef S_ISDIR
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #endif
 
 int ws_token_init(ws_token_ctx_t *ctx, const char *path) {
+    if (!ctx || !path) return -1;
     memset(ctx, 0, sizeof(*ctx));
     snprintf(ctx->path, sizeof(ctx->path), "%s", path);
 
     struct stat st;
+#ifdef WS_PLATFORM_WINDOWS
     if (stat(path, &st) < 0) {
+#else
+    /* lstat: do not follow a symlink as the token root itself */
+    if (lstat(path, &st) < 0) {
+#endif
         ws_log_error("token path not found: %s", path);
         return -1;
     }
+#ifndef WS_PLATFORM_WINDOWS
+    if (S_ISLNK(st.st_mode)) {
+        ws_log_error("token path is a symlink, refusing: %s", path);
+        return -1;
+    }
+#endif
     ctx->is_dir = S_ISDIR(st.st_mode);
     return 0;
+}
+
+/* Reject anything that isn't a plain token filename. Defends against
+ * malicious filenames like "..", "x/y", or embedded slashes. */
+static int valid_token_filename(const char *name) {
+    if (!name || !name[0]) return 0;
+    for (const char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '/' || c == '\\') return 0;
+        if (!(isalnum(c) || c == '_' || c == '-' || c == '.')) return 0;
+    }
+    /* Forbid "." and ".." explicitly */
+    if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+        return 0;
+    return 1;
+}
+
+/* Reject tokens that would be dangerous to log or compare against files.
+ * Legitimate tokens are short ASCII identifiers. */
+static int valid_token_string(const char *token) {
+    if (!token || !token[0]) return 0;
+    size_t n = strlen(token);
+    if (n > 128) return 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)token[i];
+        if (c <= 0x20 || c == 0x7f) return 0;
+    }
+    return 1;
 }
 
 void ws_token_free(ws_token_ctx_t *ctx) {
@@ -66,8 +110,23 @@ static int parse_token_line(const char *line, const char *token, ws_target_t *ta
 }
 
 static int search_file(const char *path, const char *token, ws_target_t *target) {
+#ifndef WS_PLATFORM_WINDOWS
+    /* Open with O_NOFOLLOW so symlinks inside the token directory cannot
+     * be used to redirect us to arbitrary files (e.g. /etc/passwd). */
+    int fd = open(path, O_RDONLY | O_NOFOLLOW
+#ifdef O_CLOEXEC
+                  | O_CLOEXEC
+#endif
+                  );
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) { close(fd); return -1; }
+    FILE *f = fdopen(fd, "r");
+    if (!f) { close(fd); return -1; }
+#else
     FILE *f = fopen(path, "r");
     if (!f) return -1;
+#endif
 
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
@@ -87,6 +146,8 @@ static int search_file(const char *path, const char *token, ws_target_t *target)
 }
 
 int ws_token_lookup(const ws_token_ctx_t *ctx, const char *token, ws_target_t *target) {
+    if (!ctx || !target || !valid_token_string(token)) return -1;
+
     if (!ctx->is_dir) {
         return search_file(ctx->path, token, target);
     }
@@ -97,10 +158,11 @@ int ws_token_lookup(const ws_token_ctx_t *ctx, const char *token, ws_target_t *t
 
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.') continue;
+        if (!valid_token_filename(ent->d_name)) continue;
 
         char filepath[4096];
-        snprintf(filepath, sizeof(filepath), "%s/%s", ctx->path, ent->d_name);
+        int n = snprintf(filepath, sizeof(filepath), "%s/%s", ctx->path, ent->d_name);
+        if (n < 0 || (size_t)n >= sizeof(filepath)) continue;
 
         if (search_file(filepath, token, target) == 0) {
             closedir(d);

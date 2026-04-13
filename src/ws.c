@@ -21,7 +21,16 @@ int ws_frame_parse_header(const uint8_t *data, int len, ws_frame_header_t *hdr) 
         for (int i = 0; i < 8; i++)
             plen = (plen << 8) | (uint64_t)data[2 + i];
         offset = 10;
+        /* RFC 6455: the most significant bit of a 64-bit length MUST be 0 */
+        if (plen >> 63) return -1;
     }
+
+    /* Enforce hard cap to thwart DoS via huge frames */
+    if (plen > WS_MAX_FRAME_PAYLOAD) return -1;
+
+    /* Control frames (opcode >= 0x8) must have payload <= 125 and FIN=1 */
+    if ((hdr->opcode & 0x8) && (plen > WS_MAX_CONTROL_PAYLOAD || !hdr->fin))
+        return -1;
 
     if (hdr->masked) {
         if (len < offset + 4) return 0;

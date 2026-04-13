@@ -47,12 +47,12 @@ jobs:
         run: |
           sh configure.sh
           make all
-          strip build/bin/websockify || true
+          strip build/bin/websockify2 || true
 
       - name: Package
         run: |
           mkdir -p dist
-          cp build/bin/websockify dist/
+          cp build/bin/websockify2 dist/
           cp README.md README.zh-CN.md dist/
           cd dist && tar czf ../${{ matrix.artifact }}.tar.gz *
 
@@ -91,15 +91,15 @@ jobs:
         run: |
           sh configure.sh
           make all
-          strip build/bin/websockify.exe || true
+          strip build/bin/websockify2.exe || true
 
       - name: Package
         run: |
           mkdir -p dist
-          cp build/bin/websockify.exe dist/
+          cp build/bin/websockify2.exe dist/
           cp README.md README.zh-CN.md dist/
           # Copy required DLLs
-          ldd build/bin/websockify.exe | grep mingw64 | awk '{print $3}' | xargs -I{} cp {} dist/ 2>/dev/null || true
+          ldd build/bin/websockify2.exe | grep mingw64 | awk '{print $3}' | xargs -I{} cp {} dist/ 2>/dev/null || true
           cd dist && zip -r ../websockify2-windows-x86_64.zip *
 
       - name: Upload artifact
@@ -128,12 +128,12 @@ jobs:
         run: |
           sh configure.sh
           make all
-          strip build/bin/websockify || true
+          strip build/bin/websockify2 || true
 
       - name: Package
         run: |
           mkdir -p dist
-          cp build/bin/websockify dist/
+          cp build/bin/websockify2 dist/
           cp README.md README.zh-CN.md dist/
           cd dist && tar czf ../websockify2-linux-musl-static.tar.gz *
 

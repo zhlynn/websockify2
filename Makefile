@@ -39,7 +39,7 @@ LIB_SRCS = $(filter-out $(SRCDIR)/main.c, $(SRCS))
 OBJS = $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(SRCS))
 LIB_OBJS = $(patsubst $(SRCDIR)/%.c, $(BUILDDIR)/%.o, $(LIB_SRCS))
 
-TARGET = $(BINDIR)/websockify
+TARGET = $(BINDIR)/websockify2
 
 # Add include path
 CFLAGS += -I$(SRCDIR)
@@ -116,7 +116,7 @@ test: test-unit test-integration
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/websockify
+	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/websockify2
 
 # ---- Clean ----
 

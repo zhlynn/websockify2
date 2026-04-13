@@ -18,22 +18,22 @@ class Websockify2 < Formula
     system "sh", "configure.sh"
     system "make", "all"
 
-    bin.install "build/bin/websockify"
+    bin.install "build/bin/websockify2"
   end
 
   test do
     # --version must exit cleanly and print the expected name
-    assert_match "websockify2", shell_output("#{bin}/websockify --version")
+    assert_match "websockify2", shell_output("#{bin}/websockify2 --version")
 
     # --help must succeed
-    assert_match "Usage:", shell_output("#{bin}/websockify --help")
+    assert_match "Usage:", shell_output("#{bin}/websockify2 --help")
 
     # Reject missing arguments
-    assert_match "required", shell_output("#{bin}/websockify 2>&1", 1)
+    assert_match "required", shell_output("#{bin}/websockify2 2>&1", 1)
 
     # Smoke test: start the server, confirm it binds, shut it down
     port = free_port
-    pid = spawn bin/"websockify", port.to_s, "127.0.0.1:1"
+    pid = spawn bin/"websockify2", port.to_s, "127.0.0.1:1"
     sleep 1
     Process.kill("TERM", pid)
     Process.wait(pid)

@@ -598,19 +598,33 @@ static int process_ws_frame(ws_conn_t *conn) {
 
 static int forward_target_to_client(ws_conn_t *conn) {
     while (!ws_buf_empty(&conn->target_recv)) {
+        uint32_t readable = ws_buf_readable(&conn->target_recv);
+        uint32_t chunk = readable > 8192 ? 8192 : readable;
+
+        /* Atomically reserve header+payload. A truncated write corrupts
+         * the binary frame and forces the client to disconnect (common
+         * cause of VNC black-screen / flapping). If client_send is
+         * full, apply backpressure: stop reading target until drained. */
+        uint8_t hdr[WS_MAX_FRAME_HEADER];
+        int hdr_len = ws_frame_encode_header(hdr, WS_OP_BIN, chunk, 1);
+        uint32_t need = (uint32_t)hdr_len + chunk;
+
+        if (ws_buf_writable(&conn->client_send) < need) {
+            ws_event_mod(conn->loop, conn->target_fd, 0, NULL, NULL);
+            ws_event_mod(conn->loop, conn->client_fd,
+                        WS_EV_READ | WS_EV_WRITE, NULL, NULL);
+            break;
+        }
+
         uint8_t tmp[8192];
-        uint32_t avail = ws_buf_read(&conn->target_recv, tmp, sizeof(tmp));
-        if (avail == 0) break;
+        uint32_t got = ws_buf_read(&conn->target_recv, tmp, chunk);
+        if (got == 0) break;
 
         if (conn->record)
-            ws_record_frame(conn->record, '>', tmp, (int)avail);
-
-        /* Encode as WebSocket binary frame */
-        uint8_t hdr[WS_MAX_FRAME_HEADER];
-        int hdr_len = ws_frame_encode_header(hdr, WS_OP_BIN, avail, 1);
+            ws_record_frame(conn->record, '>', tmp, (int)got);
 
         ws_buf_write(&conn->client_send, hdr, (uint32_t)hdr_len);
-        ws_buf_write(&conn->client_send, tmp, avail);
+        ws_buf_write(&conn->client_send, tmp, got);
     }
 
     return flush_client_send(conn);
@@ -734,9 +748,17 @@ static void on_client_event(ws_event_loop_t *loop, ws_socket_t fd, int events, v
         /* Flush pending send data */
         if (flush_client_send(conn) < 0) goto close_conn;
 
-        /* If send buffer empty, disable write events */
+        /* If send buffer empty, disable write events and relieve
+         * target-read backpressure so proxying resumes. */
         if (ws_buf_empty(&conn->client_send)) {
             ws_event_mod(conn->loop, conn->client_fd, WS_EV_READ, NULL, NULL);
+            if (conn->state == CONN_STATE_PROXYING && conn->target_fd >= 0) {
+                ws_event_mod(conn->loop, conn->target_fd,
+                            WS_EV_READ, NULL, NULL);
+                if (!ws_buf_empty(&conn->target_recv)) {
+                    if (forward_target_to_client(conn) < 0) goto close_conn;
+                }
+            }
         }
     }
     return;

@@ -716,7 +716,7 @@ static void on_client_event(ws_event_loop_t *loop, ws_socket_t fd, int events, v
             if (conn->file_sent < conn->file_size) {
                 uint8_t fbuf[16384];
                 size_t toread = WS_MIN(sizeof(fbuf), conn->file_size - conn->file_sent);
-                ssize_t nr = pread(conn->file_fd, fbuf, toread, (off_t)conn->file_sent);
+                ssize_t nr = ws_pread(conn->file_fd, fbuf, toread, (long long)conn->file_sent);
                 if (nr <= 0) {
                     if (nr < 0 && (ws_errno() == WS_EAGAIN || ws_errno() == WS_EINTR))
                         return;

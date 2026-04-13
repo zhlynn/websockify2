@@ -129,6 +129,16 @@
 #define WS_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define WS_MAX(a, b) ((a) > (b) ? (a) : (b))
 
+/* Positional read (pread equivalent); not thread-safe on Windows */
+static inline ssize_t ws_pread(int fd, void *buf, size_t count, long long offset) {
+#ifdef WS_PLATFORM_WINDOWS
+    if (_lseeki64(fd, offset, SEEK_SET) < 0) return -1;
+    return _read(fd, buf, (unsigned)count);
+#else
+    return pread(fd, buf, count, (off_t)offset);
+#endif
+}
+
 /* Initialize platform (Winsock, etc.) */
 int  ws_platform_init(void);
 void ws_platform_cleanup(void);

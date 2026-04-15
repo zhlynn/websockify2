@@ -108,6 +108,16 @@ BENCH_BIN = $(BINDIR)/bench_connections
 $(BENCH_BIN): $(TESTDIR)/bench/bench_connections.c $(LIB_OBJS) | $(BINDIR)
 	$(CC) $(TEST_CFLAGS) $< $(LIB_OBJS) -o $@ $(LIBS)
 
+BENCH_TP_BIN = $(BINDIR)/bench_throughput
+$(BENCH_TP_BIN): $(TESTDIR)/bench/bench_throughput.c $(LIB_OBJS) | $(BINDIR)
+	$(CC) $(TEST_CFLAGS) $< $(LIB_OBJS) -o $@ $(LIBS)
+
+ECHO_UPSTREAM_BIN = $(BINDIR)/echo_upstream
+$(ECHO_UPSTREAM_BIN): $(TESTDIR)/bench/echo_upstream.c $(LIB_OBJS) | $(BINDIR)
+	$(CC) $(TEST_CFLAGS) $< $(LIB_OBJS) -o $@ $(LIBS)
+
+bench-build: $(BENCH_TP_BIN) $(ECHO_UPSTREAM_BIN) $(TARGET)
+
 test-integration: $(TARGET) $(ECHO_SERVER)
 	@echo "=== Running integration tests ==="
 	@sh $(TESTDIR)/integration/test_proxy.sh $(TARGET) $(ECHO_SERVER)

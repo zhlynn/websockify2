@@ -3,6 +3,7 @@
 #define WS_EVENT_H
 
 #include "platform.h"
+#include <signal.h>
 
 #define WS_EV_READ   0x01
 #define WS_EV_WRITE  0x02
@@ -28,7 +29,7 @@ typedef struct {
 
 struct ws_event_loop {
     int         fd;        /* epoll/kqueue fd, -1 for poll/IOCP */
-    int         running;
+    volatile sig_atomic_t running;  /* written from signal handler */
     int         max_events;
 
 #if defined(WS_HAVE_EPOLL)

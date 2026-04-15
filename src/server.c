@@ -8,22 +8,24 @@
 /* Global proxy context (single-process). Referenced by proxy.c */
 ws_proxy_ctx_t *g_proxy_ctx = NULL;
 
-static volatile int g_running = 1;
+static volatile sig_atomic_t g_running = 1;
 static ws_event_loop_t *g_loop = NULL;
 
 #ifdef WS_PLATFORM_POSIX
 #include <signal.h>
+/* Async-signal-safe: only writes to volatile sig_atomic_t. The pending signal
+ * also interrupts epoll_wait/kevent with EINTR, so the loop wakes promptly. */
 static void signal_handler(int sig) {
     (void)sig;
     g_running = 0;
     if (g_loop)
-        ws_event_stop(g_loop);
+        g_loop->running = 0;
 }
 #else
 static BOOL WINAPI console_handler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT) {
         g_running = 0;
-        if (g_loop) ws_event_stop(g_loop);
+        if (g_loop) g_loop->running = 0;
         return TRUE;
     }
     return FALSE;
@@ -121,11 +123,10 @@ int ws_server_run(ws_config_t *config) {
                config->listen_host[0] ? config->listen_host : "*",
                config->listen_port);
 
-    while (g_running) {
-        if (ws_event_run(loop, 1000) < 0) break;
-        if (!g_running) break;
-        loop->running = 1;
-    }
+    /* ws_event_run loops internally until loop->running is cleared by the
+     * signal handler (SIGINT/SIGTERM); it returns 0 for a graceful stop and
+     * -1 on unrecoverable error. Either way we fall through to cleanup. */
+    ws_event_run(loop, 1000);
 
     ws_log_info("server shutting down");
     ws_proxy_cleanup(&proxy_ctx);

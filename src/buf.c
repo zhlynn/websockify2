@@ -26,33 +26,40 @@ int ws_buf_empty(const ws_buf_t *b) {
     return b->len == b->off;
 }
 
-int ws_buf_write(ws_buf_t *b, const void *data, uint32_t len) {
-    if (len == 0) return 0;
+int ws_buf_reserve(ws_buf_t *b, uint32_t additional) {
+    /* Ensure at least `additional` bytes fit in the writable tail.
+     * Compact first (memmove live data to offset 0) when doing so is enough
+     * to avoid a realloc — keeps steady-state cap flat under FIFO traffic. */
+    uint32_t tail_free = b->cap - b->len;
+    if (additional <= tail_free) return 0;
 
-    /* Compact first when we'd otherwise need to grow. Keeps the
-     * buffer from creeping up under steady append/drain traffic. */
-    uint32_t need = b->len + len;
-    if (need > b->cap && b->off > 0) {
+    if (b->off > 0) {
         uint32_t live = b->len - b->off;
         if (live > 0) memmove(b->data, b->data + b->off, live);
         b->len = live;
         b->off = 0;
-        need = b->len + len;
+        tail_free = b->cap - b->len;
+        if (additional <= tail_free) return 0;
     }
 
-    if (need > b->cap) {
-        uint32_t newcap = b->cap ? b->cap : 4096;
-        while (newcap < need) {
-            uint32_t grown = newcap + (newcap >> 1);
-            if (grown < newcap) return -1;  /* overflow */
-            newcap = grown;
-        }
-        uint8_t *p = (uint8_t *)realloc(b->data, newcap);
-        if (!p) return -1;
-        b->data = p;
-        b->cap = newcap;
+    uint32_t need = b->len + additional;
+    if (need < b->len) return -1;  /* overflow */
+    uint32_t newcap = b->cap ? b->cap : 4096;
+    while (newcap < need) {
+        uint32_t grown = newcap + (newcap >> 1);
+        if (grown < newcap) return -1;
+        newcap = grown;
     }
+    uint8_t *p = (uint8_t *)realloc(b->data, newcap);
+    if (!p) return -1;
+    b->data = p;
+    b->cap = newcap;
+    return 0;
+}
 
+int ws_buf_write(ws_buf_t *b, const void *data, uint32_t len) {
+    if (len == 0) return 0;
+    if (ws_buf_reserve(b, len) < 0) return -1;
     memcpy(b->data + b->len, data, len);
     b->len += len;
     return 0;

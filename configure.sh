@@ -6,8 +6,8 @@ set -e
 
 PREFIX="${PREFIX:-/usr/local}"
 CC="${CC:-cc}"
-CFLAGS="${CFLAGS:--O2 -Wall -Wextra -Wpedantic}"
-LDFLAGS="${LDFLAGS:-}"
+CFLAGS="${CFLAGS:--O3 -march=native -flto -Wall -Wextra -Wpedantic}"
+LDFLAGS="${LDFLAGS:--flto}"
 LIBS=""
 
 # Detect OS

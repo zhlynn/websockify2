@@ -85,17 +85,78 @@ else
 fi
 
 # ============================================
-# Test 4: Graceful shutdown
+# Test 4: Graceful shutdown (time-bounded, SIGTERM + SIGINT,
+#         idle and with an active WebSocket connection)
 # ============================================
+
+# wait_exit <pid> <max_deciseconds> -> 0 if exited, 1 if still running
+wait_exit() {
+    _p=$1; _n=$2; _i=0
+    while [ $_i -lt $_n ]; do
+        if ! kill -0 $_p 2>/dev/null; then return 0; fi
+        sleep 0.1
+        _i=$((_i + 1))
+    done
+    kill -0 $_p 2>/dev/null && return 1 || return 0
+}
+
+# SIGTERM on the idle proxy from earlier tests — must exit within 2s
 kill -TERM $WS_PID 2>/dev/null
-wait $WS_PID 2>/dev/null
-EXIT_CODE=$?
-# Exit code is 143 (128+15) for SIGTERM on most systems
-if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ]; then
-    assert_pass 0 "graceful shutdown on SIGTERM"
+if wait_exit $WS_PID 20; then
+    wait $WS_PID 2>/dev/null
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ]; then
+        assert_pass 0 "SIGTERM idle shutdown (<=2s, exit $EXIT_CODE)"
+    else
+        assert_pass 1 "SIGTERM idle shutdown — bad exit code ($EXIT_CODE)"
+    fi
 else
-    assert_pass 1 "graceful shutdown on SIGTERM (exit code: $EXIT_CODE)"
+    kill -9 $WS_PID 2>/dev/null; wait $WS_PID 2>/dev/null
+    assert_pass 1 "SIGTERM idle shutdown — hung past 2s"
 fi
+
+# SIGINT on a fresh proxy — also time-bounded
+$WEBSOCKIFY $WS_PORT localhost:$ECHO_PORT &
+WS_PID=$!
+sleep 0.3
+kill -INT $WS_PID 2>/dev/null
+if wait_exit $WS_PID 20; then
+    wait $WS_PID 2>/dev/null
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 130 ]; then
+        assert_pass 0 "SIGINT shutdown (<=2s, exit $EXIT_CODE)"
+    else
+        assert_pass 1 "SIGINT shutdown — bad exit code ($EXIT_CODE)"
+    fi
+else
+    kill -9 $WS_PID 2>/dev/null; wait $WS_PID 2>/dev/null
+    assert_pass 1 "SIGINT shutdown — hung past 2s"
+fi
+
+# SIGTERM while an active client connection is mid-handshake — verifies
+# that the signal wakes the event loop even when fds are registered.
+$WEBSOCKIFY $WS_PORT localhost:$ECHO_PORT &
+WS_PID=$!
+sleep 0.3
+# Open a raw TCP conn and leave it idle (keeps the client fd registered)
+( exec 3<>/dev/tcp/127.0.0.1/$WS_PORT 2>/dev/null; sleep 5 ) &
+RAW_PID=$!
+sleep 0.2
+kill -TERM $WS_PID 2>/dev/null
+if wait_exit $WS_PID 20; then
+    wait $WS_PID 2>/dev/null
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 143 ]; then
+        assert_pass 0 "SIGTERM with active connection (<=2s, exit $EXIT_CODE)"
+    else
+        assert_pass 1 "SIGTERM with active connection — bad exit code ($EXIT_CODE)"
+    fi
+else
+    kill -9 $WS_PID 2>/dev/null; wait $WS_PID 2>/dev/null
+    assert_pass 1 "SIGTERM with active connection — hung past 2s"
+fi
+kill $RAW_PID 2>/dev/null || true
+wait $RAW_PID 2>/dev/null || true
 
 kill $ECHO_PID 2>/dev/null || true
 wait $ECHO_PID 2>/dev/null || true

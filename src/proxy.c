@@ -6,6 +6,10 @@
 #include "web.h"
 #include "log.h"
 
+#ifdef WS_PLATFORM_POSIX
+#include <sys/uio.h>
+#endif
+
 /* Forward declarations */
 static void conn_close(ws_conn_t *conn);
 static void on_client_event(ws_event_loop_t *loop, ws_socket_t fd, int events, void *data);
@@ -438,12 +442,11 @@ static int handle_http_request(ws_conn_t *conn) {
 
 static int flush_client_send(ws_conn_t *conn) {
     while (!ws_buf_empty(&conn->client_send)) {
-        uint8_t tmp[8192];
-        uint32_t avail = ws_buf_peek(&conn->client_send, tmp, sizeof(tmp));
-        int sent = client_send_raw(conn, tmp, (int)avail);
+        const uint8_t *p; uint32_t avail;
+        ws_buf_peek_ptr(&conn->client_send, &p, &avail);
+        int sent = client_send_raw(conn, p, (int)avail);
         if (sent <= 0) {
             if (sent == 0) {
-                /* Would block — enable write events */
                 ws_event_mod(conn->loop, conn->client_fd,
                             WS_EV_READ | WS_EV_WRITE, NULL, NULL);
                 return 0;
@@ -457,9 +460,9 @@ static int flush_client_send(ws_conn_t *conn) {
 
 static int flush_target_send(ws_conn_t *conn) {
     while (!ws_buf_empty(&conn->target_send)) {
-        uint8_t tmp[8192];
-        uint32_t avail = ws_buf_peek(&conn->target_send, tmp, sizeof(tmp));
-        ssize_t sent = send(conn->target_fd, tmp, avail, 0);
+        const uint8_t *p; uint32_t avail;
+        ws_buf_peek_ptr(&conn->target_send, &p, &avail);
+        ssize_t sent = send(conn->target_fd, p, avail, 0);
         if (sent <= 0) {
             if (sent < 0 && (ws_errno() == WS_EAGAIN || ws_errno() == WS_EINTR)) {
                 ws_event_mod(conn->loop, conn->target_fd,
@@ -475,17 +478,54 @@ static int flush_target_send(ws_conn_t *conn) {
 
 /* ---- WebSocket frame processing ---- */
 
+#ifdef WS_PLATFORM_POSIX
+/* Flush a batched iovec of unmasked payloads to the target socket. Any bytes
+ * not sent by writev() (EAGAIN or short-write) are buffered into target_send
+ * so the caller can drain them later via flush_target_send(). */
+static int flush_batch_iov(ws_conn_t *conn, struct iovec *iov, int n, uint32_t total) {
+    ssize_t sent = writev(conn->target_fd, iov, n);
+    if (sent < 0) {
+        if (!(ws_errno() == WS_EAGAIN || ws_errno() == WS_EINTR))
+            return -1;
+        sent = 0;
+    }
+    if ((uint32_t)sent < total) {
+        size_t skip = (size_t)sent;
+        for (int i = 0; i < n; i++) {
+            size_t ilen = iov[i].iov_len;
+            if (skip >= ilen) { skip -= ilen; continue; }
+            if (ws_buf_write(&conn->target_send,
+                             (uint8_t *)iov[i].iov_base + skip,
+                             (uint32_t)(ilen - skip)) < 0) return -1;
+            skip = 0;
+        }
+    }
+    return 0;
+}
+#endif
+
 static int process_ws_frame(ws_conn_t *conn) {
+#ifdef WS_PLATFORM_POSIX
+    /* Batched writev path: collect unmasked data-frame payloads straight out
+     * of client_recv and send them to target_fd in one syscall at the end of
+     * the loop. Safe because ws_buf_drain only advances cursors — it never
+     * memmoves bytes — so iov pointers stay valid; and we never write to
+     * client_recv inside this function. */
+    enum { BATCH_IOV_MAX = 128 };
+    struct iovec batch[BATCH_IOV_MAX];
+    int batch_n = 0;
+    uint32_t batch_bytes = 0;
+#endif
+
     for (;;) {
         uint32_t avail = ws_buf_readable(&conn->client_recv);
         if (avail == 0) break;
 
         if (!conn->ws_hdr_parsed) {
-            /* Try to parse frame header */
-            uint8_t hdr_buf[WS_MAX_FRAME_HEADER];
-            uint32_t peek = ws_buf_peek(&conn->client_recv, hdr_buf,
-                                         WS_MIN(avail, WS_MAX_FRAME_HEADER));
-            int hdr_len = ws_frame_parse_header(hdr_buf, (int)peek, &conn->ws_hdr);
+            const uint8_t *hp; uint32_t hlen;
+            ws_buf_peek_ptr(&conn->client_recv, &hp, &hlen);
+            int need = (int)WS_MIN(hlen, (uint32_t)WS_MAX_FRAME_HEADER);
+            int hdr_len = ws_frame_parse_header(hp, need, &conn->ws_hdr);
             if (hdr_len == 0) break;  /* need more data */
             if (hdr_len < 0) return -1;
 
@@ -494,10 +534,8 @@ static int process_ws_frame(ws_conn_t *conn) {
             conn->ws_payload_read = 0;
         }
 
-        /* Read payload */
         uint64_t remaining = conn->ws_hdr.payload_len - conn->ws_payload_read;
         if (remaining == 0) {
-            /* Frame complete */
             conn->ws_hdr_parsed = 0;
             continue;
         }
@@ -506,14 +544,82 @@ static int process_ws_frame(ws_conn_t *conn) {
         if (avail == 0) break;
 
         uint32_t chunk = (uint32_t)WS_MIN((uint64_t)avail, remaining);
-        uint8_t tmp[8192];
-        while (chunk > 0) {
-            uint32_t rd = ws_buf_read(&conn->client_recv, tmp, WS_MIN(chunk, (uint32_t)sizeof(tmp)));
-            if (rd == 0) break;
 
-            /* Unmask if needed. Rotate the mask by the payload offset
-             * already consumed so the 64-bit fast path in
-             * ws_frame_apply_mask stays correct across chunks. */
+        int is_data = (conn->ws_hdr.opcode == WS_OP_BIN ||
+                       conn->ws_hdr.opcode == WS_OP_TEXT ||
+                       conn->ws_hdr.opcode == WS_OP_CONT);
+
+        if (is_data) {
+            const uint8_t *cp; uint32_t clen;
+            ws_buf_peek_ptr(&conn->client_recv, &cp, &clen);
+            uint32_t take = WS_MIN(chunk, clen);
+            uint8_t *mp = (uint8_t *)cp;  /* unmask in place */
+
+            if (conn->ws_hdr.masked) {
+                uint8_t rot[4];
+                uint32_t off = (uint32_t)(conn->ws_payload_read & 3);
+                rot[0] = conn->ws_hdr.mask[(0 + off) & 3];
+                rot[1] = conn->ws_hdr.mask[(1 + off) & 3];
+                rot[2] = conn->ws_hdr.mask[(2 + off) & 3];
+                rot[3] = conn->ws_hdr.mask[(3 + off) & 3];
+                ws_frame_apply_mask(mp, take, rot);
+            }
+            if (conn->record)
+                ws_record_frame(conn->record, '<', mp, (int)take);
+
+#ifdef WS_PLATFORM_POSIX
+            /* Batch path: only valid while target_send is empty (ordering)
+             * AND the payload is large enough that the iov-entry overhead
+             * is amortized. For sub-KB messages the kernel's per-iov cost
+             * beats what we save on the memcpy. Drain updates cursors only,
+             * so iov pointers stay live until we writev below. */
+            if (take >= 512 && ws_buf_empty(&conn->target_send)) {
+                if (batch_n == BATCH_IOV_MAX) {
+                    if (flush_batch_iov(conn, batch, batch_n, batch_bytes) < 0)
+                        return -1;
+                    batch_n = 0;
+                    batch_bytes = 0;
+                }
+                /* target_send may have filled from a partial writev above.
+                 * Re-check to stay ordered. */
+                if (ws_buf_empty(&conn->target_send)) {
+                    batch[batch_n].iov_base = mp;
+                    batch[batch_n].iov_len = take;
+                    batch_n++;
+                    batch_bytes += take;
+                    ws_buf_drain(&conn->client_recv, take);
+                    conn->ws_payload_read += take;
+                    if (conn->ws_payload_read == conn->ws_hdr.payload_len)
+                        conn->ws_hdr_parsed = 0;
+                    continue;
+                }
+            }
+#endif
+
+            /* Fallback: target_send already has buffered data, so ordering
+             * forces us to append here too. */
+            if (ws_buf_write(&conn->target_send, mp, take) < 0) return -1;
+            ws_buf_drain(&conn->client_recv, take);
+            conn->ws_payload_read += take;
+            if (conn->ws_payload_read == conn->ws_hdr.payload_len)
+                conn->ws_hdr_parsed = 0;
+        } else {
+#ifdef WS_PLATFORM_POSIX
+            /* Control frames have side effects on the client-side response
+             * buffer, so flush any pending data-frame batch first to keep
+             * target-side writes in submission order. */
+            if (batch_n > 0) {
+                if (flush_batch_iov(conn, batch, batch_n, batch_bytes) < 0)
+                    return -1;
+                batch_n = 0;
+                batch_bytes = 0;
+            }
+#endif
+            /* Control frames: small, use tmp */
+            uint8_t tmp[128 + WS_MAX_FRAME_HEADER];
+            uint32_t rd = ws_buf_read(&conn->client_recv, tmp,
+                                       WS_MIN(chunk, (uint32_t)WS_MAX_CONTROL_PAYLOAD + 4));
+            if (rd == 0) break;
             if (conn->ws_hdr.masked) {
                 uint8_t rot[4];
                 uint32_t off = (uint32_t)(conn->ws_payload_read & 3);
@@ -523,39 +629,30 @@ static int process_ws_frame(ws_conn_t *conn) {
                 rot[3] = conn->ws_hdr.mask[(3 + off) & 3];
                 ws_frame_apply_mask(tmp, rd, rot);
             }
-
-            /* Handle based on opcode */
             switch (conn->ws_hdr.opcode) {
-            case WS_OP_BIN:
-            case WS_OP_TEXT:
-            case WS_OP_CONT:
-                if (ws_buf_write(&conn->target_send, tmp, rd) < 0) return -1;
-                if (conn->record)
-                    ws_record_frame(conn->record, '<', tmp, (int)rd);
-                break;
-
             case WS_OP_PING: {
-                /* Reply with pong */
                 uint8_t pong[128 + WS_MAX_FRAME_HEADER];
                 int pong_len = ws_frame_encode_pong(pong, tmp, (int)rd);
                 ws_buf_write(&conn->client_send, pong, (uint32_t)pong_len);
                 break;
             }
-
-            case WS_OP_PONG:
-                /* Ignore */
-                break;
-
-            case WS_OP_CLOSE:
-                return -1;  /* Client initiated close */
+            case WS_OP_PONG: break;
+            case WS_OP_CLOSE: return -1;
+            default: break;
             }
-
             conn->ws_payload_read += rd;
-            chunk -= rd;
+            if (conn->ws_payload_read == conn->ws_hdr.payload_len)
+                conn->ws_hdr_parsed = 0;
         }
     }
 
-    /* Flush data to target */
+#ifdef WS_PLATFORM_POSIX
+    if (batch_n > 0) {
+        if (flush_batch_iov(conn, batch, batch_n, batch_bytes) < 0)
+            return -1;
+    }
+#endif
+
     if (!ws_buf_empty(&conn->target_send))
         flush_target_send(conn);
     if (!ws_buf_empty(&conn->client_send))
@@ -568,20 +665,66 @@ static int process_ws_frame(ws_conn_t *conn) {
 
 static int forward_target_to_client(ws_conn_t *conn) {
     while (!ws_buf_empty(&conn->target_recv)) {
-        uint32_t readable = ws_buf_readable(&conn->target_recv);
-        uint32_t chunk = readable > 8192 ? 8192 : readable;
-
-        uint8_t tmp[8192];
-        uint32_t got = ws_buf_read(&conn->target_recv, tmp, chunk);
-        if (got == 0) break;
+        const uint8_t *p; uint32_t avail;
+        ws_buf_peek_ptr(&conn->target_recv, &p, &avail);
+        uint32_t chunk = avail;  /* send everything as one frame */
 
         if (conn->record)
-            ws_record_frame(conn->record, '>', tmp, (int)got);
+            ws_record_frame(conn->record, '>', p, (int)chunk);
 
         uint8_t hdr[WS_MAX_FRAME_HEADER];
-        int hdr_len = ws_frame_encode_header(hdr, WS_OP_BIN, got, 1);
+        int hdr_len = ws_frame_encode_header(hdr, WS_OP_BIN, chunk, 1);
+
+#ifdef WS_PLATFORM_POSIX
+        /* Zero-copy fast path: writev header + payload. Since target_recv
+         * coalesces multiple upstream replies into one big chunk per event,
+         * even nominally "small" messages end up >1 KiB here and benefit
+         * from the single-syscall writev. */
+        if (!conn->client_ssl && ws_buf_empty(&conn->client_send)) {
+            struct iovec iov[2];
+            iov[0].iov_base = hdr;          iov[0].iov_len = (size_t)hdr_len;
+            iov[1].iov_base = (void *)p;    iov[1].iov_len = chunk;
+            ssize_t sent = writev(conn->client_fd, iov, 2);
+            if (sent < 0) {
+                if (ws_errno() == WS_EAGAIN || ws_errno() == WS_EINTR) {
+                    if (ws_buf_write(&conn->client_send, hdr, (uint32_t)hdr_len) < 0) return -1;
+                    if (ws_buf_write(&conn->client_send, p, chunk) < 0) return -1;
+                    ws_buf_drain(&conn->target_recv, chunk);
+                    ws_event_mod(conn->loop, conn->client_fd,
+                                 WS_EV_READ | WS_EV_WRITE, NULL, NULL);
+                    return 0;
+                }
+                return -1;
+            }
+            size_t total = (size_t)hdr_len + chunk;
+            if ((size_t)sent < total) {
+                /* Partial write: buffer the unsent remainder */
+                size_t remaining = total - (size_t)sent;
+                if ((size_t)sent < (size_t)hdr_len) {
+                    size_t hdr_left = (size_t)hdr_len - (size_t)sent;
+                    if (ws_buf_write(&conn->client_send,
+                                     hdr + sent, (uint32_t)hdr_left) < 0) return -1;
+                    if (ws_buf_write(&conn->client_send, p, chunk) < 0) return -1;
+                } else {
+                    size_t payload_sent = (size_t)sent - (size_t)hdr_len;
+                    if (ws_buf_write(&conn->client_send,
+                                     p + payload_sent,
+                                     (uint32_t)(chunk - payload_sent)) < 0) return -1;
+                }
+                (void)remaining;
+                ws_buf_drain(&conn->target_recv, chunk);
+                ws_event_mod(conn->loop, conn->client_fd,
+                             WS_EV_READ | WS_EV_WRITE, NULL, NULL);
+                return 0;
+            }
+            /* Fully sent */
+            ws_buf_drain(&conn->target_recv, chunk);
+            continue;
+        }
+#endif
         if (ws_buf_write(&conn->client_send, hdr, (uint32_t)hdr_len) < 0) return -1;
-        if (ws_buf_write(&conn->client_send, tmp, got) < 0) return -1;
+        if (ws_buf_write(&conn->client_send, p, chunk) < 0) return -1;
+        ws_buf_drain(&conn->target_recv, chunk);
     }
 
     return flush_client_send(conn);
@@ -645,29 +788,42 @@ static void on_client_event(ws_event_loop_t *loop, ws_socket_t fd, int events, v
             return;
         }
 
-        /* Read data from client */
-        uint8_t tmp[8192];
-        for (;;) {
-            int n = client_recv(conn, tmp, sizeof(tmp));
-            if (n <= 0) {
-                if (n < 0) goto close_conn;
-                break;
-            }
-
-            if (conn->state == CONN_STATE_HTTP_REQUEST) {
-                /* Cap header size BEFORE appending so oversize requests
-                 * can never trigger large allocations. */
+        if (conn->state == CONN_STATE_HTTP_REQUEST) {
+            /* HTTP requests are small — stage through a tmp buffer so the
+             * header-size cap check runs before touching http_buf. */
+            uint8_t tmp[16384];
+            for (;;) {
+                int n = client_recv(conn, tmp, sizeof(tmp));
+                if (n <= 0) {
+                    if (n < 0) goto close_conn;
+                    break;
+                }
                 if (conn->http_buf.len + (uint32_t)n > WS_MAX_HEADER_SIZE)
                     goto close_conn;
                 if (ws_dbuf_append(&conn->http_buf, tmp, (uint32_t)n) < 0)
                     goto close_conn;
                 if (handle_http_request(conn) < 0) goto close_conn;
-            } else if (conn->state == CONN_STATE_PROXYING ||
-                       conn->state == CONN_STATE_CONNECTING) {
-                /* Buffer data; if still CONNECTING, it'll be processed
-                 * once on_target_connect switches to PROXYING. */
-                if (ws_buf_write(&conn->client_recv, tmp, (uint32_t)n) < 0)
-                    goto close_conn;
+                /* State may have flipped to CONNECTING — stop the HTTP loop
+                 * so the zero-copy path below picks up any trailing bytes. */
+                if (conn->state != CONN_STATE_HTTP_REQUEST) break;
+            }
+        }
+
+        if (conn->state == CONN_STATE_PROXYING ||
+            conn->state == CONN_STATE_CONNECTING) {
+            /* Zero-copy recv path: read straight into client_recv's writable
+             * tail, skipping the tmp-buffer memcpy. Reserve sizes recv blocks
+             * at ~64 KiB so kernel reads stay large. */
+            for (;;) {
+                if (ws_buf_reserve(&conn->client_recv, 65536) < 0) goto close_conn;
+                uint8_t *tp; uint32_t tcap;
+                ws_buf_tail_ptr(&conn->client_recv, &tp, &tcap);
+                int n = client_recv(conn, tp, (int)tcap);
+                if (n <= 0) {
+                    if (n < 0) goto close_conn;
+                    break;
+                }
+                ws_buf_commit(&conn->client_recv, (uint32_t)n);
             }
         }
 
@@ -728,16 +884,19 @@ static void on_target_event(ws_event_loop_t *loop, ws_socket_t fd, int events, v
     conn->last_activity = ws_time_ms();
 
     if (events & WS_EV_READ) {
-        uint8_t tmp[8192];
+        /* Zero-copy recv: drain the target socket straight into
+         * target_recv's writable tail to avoid a tmp-buffer memcpy. */
         for (;;) {
-            ssize_t n = recv(conn->target_fd, tmp, sizeof(tmp), 0);
+            if (ws_buf_reserve(&conn->target_recv, 65536) < 0) goto close_conn;
+            uint8_t *tp; uint32_t tcap;
+            ws_buf_tail_ptr(&conn->target_recv, &tp, &tcap);
+            ssize_t n = recv(conn->target_fd, tp, (size_t)tcap, 0);
             if (n <= 0) {
                 if (n == 0) goto close_conn;
                 if (ws_errno() == WS_EAGAIN || ws_errno() == WS_EINTR) break;
                 goto close_conn;
             }
-            if (ws_buf_write(&conn->target_recv, tmp, (uint32_t)n) < 0)
-                goto close_conn;
+            ws_buf_commit(&conn->target_recv, (uint32_t)n);
         }
 
         if (forward_target_to_client(conn) < 0) goto close_conn;
